@@ -17,7 +17,7 @@ func main() {
 	opt := &github.ListOptions{Page: 1}
 	users, _, err := client.Users.ListFollowers(context.Background(), "wenmingtang", opt)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Println(err.Error())
 	}
 	for _, u := range users {
 		fmt.Println(*u.Login, *u.URL)

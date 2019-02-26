@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/google/go-querystring/query"
+	"github.com/micro/protobuf/ptypes/timestamp"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -119,6 +121,48 @@ func (r *Response) populatePageValues() {
 
 }
 
+type Error struct {
+	Resource string `json:"resource"`
+	Field    string `json:"field"`
+	Code     string `json:"code"`
+	Message  string `json:"message"`
+}
+
+func (e *Error) Error() string {
+	return fmt.Sprintf("%v error caused by %v field on %v resouce", e.Code, e.Field, e.Resource)
+}
+
+type ErrorResponse struct {
+	Response *http.Response
+	Message  string  `json:"message"`
+	Errors   []Error `json:"errors"`
+
+	Block *struct {
+		Reason    string               `json:"reason,omitempty"`
+		CreatedAt *timestamp.Timestamp `json:"created_at,omitempty"`
+	}
+
+	DocumentationURL string `json:"documentation_url,omitempty"`
+}
+
+func (r *ErrorResponse) Error() string {
+	return fmt.Sprintf("%v %v: %d %v %+v",
+		r.Response.Request.Method, r.Response.Request.URL,
+		r.Response.StatusCode, r.Message, r.Errors)
+}
+
+func CheckResponse(r *http.Response) error {
+	if c := r.StatusCode; 200 <= c && c <= 299 {
+		return nil
+	}
+	errorResponse := &ErrorResponse{Response: r}
+	data, err := ioutil.ReadAll(r.Body)
+	if err == nil && data != nil {
+		json.Unmarshal(data, errorResponse)
+	}
+	return errorResponse
+}
+
 func (c *Client) Do(ctx context.Context, req *http.Request, v interface{}) (*Response, error) {
 	req = req.WithContext(ctx)
 
@@ -141,6 +185,11 @@ func (c *Client) Do(ctx context.Context, req *http.Request, v interface{}) (*Res
 	defer resp.Body.Close()
 
 	response := newResponse(resp)
+
+	err = CheckResponse(resp)
+	if err != nil {
+		return response, err
+	}
 
 	if v != nil {
 		if w, ok := v.(io.Writer); ok {
