@@ -13,4 +13,13 @@ func main() {
 		fmt.Println(err)
 	}
 	fmt.Println(*user.ID, *user.Login, *user.URL, *user.AvatarURL)
+
+	opt := &github.ListOptions{Page: 1}
+	users, _, err := client.Users.ListFollowers(context.Background(), "wenmingtang", opt)
+	if err != nil {
+		fmt.Println(err)
+	}
+	for _, u := range users {
+		fmt.Println(*u.Login, *u.URL)
+	}
 }
