@@ -6,19 +6,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/google/go-querystring/query"
-	"github.com/micro/protobuf/ptypes/timestamp"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
+	"time"
 )
 
 const (
 	defaultBaseURL = "https://api.github.com/"
 	userAgent      = "go-github"
 	mediaTypeV3    = "application/vnd.github.v3+json"
+
+	headerRateLimit     = "X-RateLimit-Limit"
+	headerRateRemaining = "X-RateLimit-Remaining"
+	headerRateReset     = "X-RateLimit-Reset"
 )
 
 type Client struct {
@@ -109,11 +114,13 @@ type Response struct {
 	PrevPage  int
 	FirstPage int
 	LastPage  int
+	Rate      Rate
 }
 
 func newResponse(r *http.Response) *Response {
 	response := &Response{Response: r}
 	response.populatePageValues()
+	response.Rate = parseRate(r)
 	return response
 }
 
@@ -138,11 +145,51 @@ type ErrorResponse struct {
 	Errors   []Error `json:"errors"`
 
 	Block *struct {
-		Reason    string               `json:"reason,omitempty"`
-		CreatedAt *timestamp.Timestamp `json:"created_at,omitempty"`
+		Reason    string     `json:"reason,omitempty"`
+		CreatedAt *time.Time `json:"created_at,omitempty"`
 	}
 
 	DocumentationURL string `json:"documentation_url,omitempty"`
+}
+
+type Rate struct {
+	Limit     int       `json:"limit"`
+	Remaining int       `json:"remaining"`
+	Reset     time.Time `json:"reset"`
+}
+
+type RateLimitError struct {
+	Rate     Rate
+	Response *http.Response
+	Message  string `json:"message"`
+}
+
+func (r *RateLimitError) Error() string {
+	return fmt.Sprintf("%v %v: %d %v %v",
+		r.Response.Request.Method, r.Response.Request.URL,
+		r.Response.StatusCode, r.Message, formatRateReset(r.Rate.Reset.Sub(time.Now())))
+}
+
+func formatRateReset(d time.Duration) string {
+	isNegative := d < 0
+	if isNegative {
+		d *= -1
+	}
+	secondsTotal := int(0.5 + d.Seconds())
+	minutes := secondsTotal / 60
+	seconds := secondsTotal - minutes*60
+
+	var timeString string
+	if minutes > 0 {
+		timeString = fmt.Sprintf("%dm%02ds", minutes, seconds)
+	} else {
+		timeString = fmt.Sprintf("%ds", seconds)
+	}
+
+	if isNegative {
+		return fmt.Sprintf("[rate limit was reset %v ago]", timeString)
+	}
+	return fmt.Sprintf("[rate reset in %v]", timeString)
 }
 
 func (r *ErrorResponse) Error() string {
@@ -160,7 +207,33 @@ func CheckResponse(r *http.Response) error {
 	if err == nil && data != nil {
 		json.Unmarshal(data, errorResponse)
 	}
-	return errorResponse
+
+	switch {
+	case r.StatusCode == http.StatusForbidden && r.Header.Get(headerRateRemaining) == "0" && strings.HasSuffix(errorResponse.Message, "API rate limit exceeded for "):
+		return &RateLimitError{
+			Rate:     parseRate(r),
+			Response: errorResponse.Response,
+			Message:  errorResponse.Message,
+		}
+	default:
+		return errorResponse
+	}
+}
+
+func parseRate(r *http.Response) Rate {
+	var rate Rate
+	if limit := r.Header.Get(headerRateLimit); limit != "" {
+		rate.Limit, _ = strconv.Atoi(limit)
+	}
+	if remaining := r.Header.Get(headerRateRemaining); remaining != "" {
+		rate.Remaining, _ = strconv.Atoi(remaining)
+	}
+	if reset := r.Header.Get(headerRateReset); reset != "" {
+		if v, _ := strconv.ParseInt(reset, 10, 64); v != 0 {
+			rate.Reset = time.Unix(v, 0)
+		}
+	}
+	return rate
 }
 
 func (c *Client) Do(ctx context.Context, req *http.Request, v interface{}) (*Response, error) {
@@ -183,14 +256,11 @@ func (c *Client) Do(ctx context.Context, req *http.Request, v interface{}) (*Res
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	response := newResponse(resp)
-
 	err = CheckResponse(resp)
 	if err != nil {
 		return response, err
 	}
-
 	if v != nil {
 		if w, ok := v.(io.Writer); ok {
 			io.Copy(w, resp.Body)
